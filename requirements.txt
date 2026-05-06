@@ -13,7 +13,10 @@ redis==5.1.1
 
 # Embeddings & reranking
 sentence-transformers==3.1.1
-torch==2.4.1
+# torch is a transitive dependency of sentence-transformers.
+# Do not pin it — the right wheel depends on your OS, CPU arch, and Python version.
+# sentence-transformers will pull a compatible version automatically.
+torch
 
 # LangChain / LangGraph (Phase 4)
 langchain==0.3.3
