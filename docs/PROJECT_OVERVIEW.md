@@ -100,6 +100,10 @@ Understanding both is the key to understanding every file in the codebase.
 ║  [Citation Agent]                                                ║
 ║  → Final answer with inline citations                            ║
 ║  → Each citation: claim + supporting log line + confidence score ║
+║      │                                                           ║
+║      ▼                                                           ║
+║  Every LLM call traced automatically via LangSmith              ║
+║  Every request logged as structured JSON via structlog           ║
 ╚══════════════════════════════════════════════════════════════════╝
 ```
 
@@ -247,7 +251,7 @@ clean → chunk → embed → qdrant.upsert() + es.index()
 
 #### Step 1 — Query planning
 
-**Agent:** Planner Agent *(Phase 4 — coming next)*
+**Agent:** Planner Agent (`src/agents/planner.py`)
 
 The raw user question:
 > "Why did checkout fail after the deployment at 4pm?"
@@ -343,7 +347,7 @@ then makes a precise final selection from that small set.
 
 #### Step 4 — Reasoning
 
-**Agent:** Reasoning Agent *(Phase 4)*
+**Agent:** Reasoning Agent (`src/agents/reasoning.py`)
 
 The agent receives the top-5 chunks and the original question.
 It builds a timeline and writes a draft RCA constrained to the evidence:
@@ -371,7 +375,7 @@ The system prompt enforces evidence-only reasoning:
 
 #### Step 5 — Critic validation
 
-**Agent:** Critic Agent *(Phase 4)*
+**Agent:** Critic Agent (`src/agents/critic.py`)
 
 Every factual claim in the RCA is checked against the source chunks.
 If the Reasoning Agent says "error rate reached 78%" but no chunk contains that
@@ -384,7 +388,7 @@ Unsupported claims trigger the Reflection Agent.
 
 #### Step 6 — Reflection and retry
 
-**Agent:** Reflection Agent *(Phase 4)*
+**Agent:** Reflection Agent (`src/agents/reflection.py`)
 
 Unsupported claims become new retrieval queries:
 
@@ -401,7 +405,7 @@ those claims with a low-confidence flag.
 
 #### Step 7 — Citation
 
-**Agent:** Citation Agent *(Phase 4)*
+**Agent:** Citation Agent (`src/agents/citation.py`)
 
 The final response is formatted with inline evidence:
 
@@ -417,6 +421,57 @@ Citations:
 [3] 16:00:26 CRITICAL checkout-service Error rate 78% — triggering automatic rollback
 [4] 16:00:27 INFO checkout-service Rollback initiated v2.3.1 → v2.3.0
 [5] 16:00:45 INFO checkout-service Error rate 0.3% — back to normal
+```
+
+---
+
+### Observability
+
+**File:** `src/observability/logger.py`
+
+Every request through the system emits structured JSON logs via structlog:
+
+```json
+{"event": "ingest_complete", "chunks": 47, "service": "payment-service", "level": "info", "timestamp": "2024-01-15T14:28:10Z"}
+{"event": "retrieval_done", "bm25_count": 20, "vector_count": 20, "reranked_count": 5, "level": "info"}
+{"event": "eval_run_done", "answer_length": 412, "contexts_count": 5, "retry_count": 1, "level": "info"}
+```
+
+`get_logger(__name__)` returns a bound logger with the module name attached —
+logs from each layer are identifiable without adding boilerplate to every call.
+
+LangSmith traces every LLM call automatically when `LANGCHAIN_TRACING_V2=true`
+is set in `.env`. No code changes are needed — the LangChain integration
+instruments all ChatOpenAI calls transparently.
+
+---
+
+### Evaluation
+
+**Files:** `src/evaluation/ground_truth.py`, `src/evaluation/pipeline.py`,
+`src/evaluation/metrics.py`
+
+**Script:** `scripts/evaluate.py`
+
+The evaluation pipeline measures four RAG quality dimensions using Ragas:
+
+| Metric | What it measures | Threshold |
+|---|---|---|
+| `faithfulness` | Are all claims in the answer supported by retrieved chunks? | ≥ 0.80 |
+| `answer_relevancy` | Does the answer address the actual question? | ≥ 0.75 |
+| `context_precision` | Are retrieved chunks relevant (low noise)? | ≥ 0.70 |
+| `context_recall` | Did retrieval find all the needed evidence? | ≥ 0.70 |
+
+Five hand-written ground truth scenarios cover: DB connection pool exhaustion,
+OOMKill restart loops, deployment-triggered error spikes, cross-scenario
+correlation, and an out-of-scope negative test.
+
+Run before every change to agent prompts, retrieval parameters, or chunking strategy:
+
+```bash
+python scripts/evaluate.py              # run all 5 scenarios
+python scripts/evaluate.py --question 1 # run only scenario 1 (1-indexed)
+python scripts/evaluate.py --dry-run    # print ground truth without running agents
 ```
 
 ---
@@ -444,8 +499,8 @@ src/
 │   ├── reranker.py             Cross-encoder final ranking
 │   └── retrieval_engine.py     Single entry point: hybrid → rerank
 │
-├── agents/                     Phase 4 — LangGraph multi-agent system
-│   ├── state.py                AgentState TypedDict
+├── agents/
+│   ├── state.py                AgentState TypedDict shared across all nodes
 │   ├── planner.py              Structures query into typed plan
 │   ├── retriever.py            Calls retrieval_engine as a Tool
 │   ├── reasoning.py            Builds timeline and draft RCA
@@ -454,21 +509,26 @@ src/
 │   ├── citation.py             Formats final answer with citations
 │   └── graph.py                Wires all agents into LangGraph state machine
 │
-├── api/                        Phase 5 — FastAPI endpoints
-│   ├── main.py                 App factory, middleware registration
+├── api/
+│   ├── app.py                  App factory, middleware registration, LangSmith wiring
 │   ├── routes/
 │   │   ├── ingest.py           POST /api/v1/ingest
 │   │   └── query.py            POST /api/v1/query, WS /api/v1/query/stream
 │   └── middleware.py           Request ID injection
 │
-├── observability/              Phase 6 — Tracing and structured logging
-│   └── logger.py               structlog JSON logger with request_id
+├── observability/
+│   └── logger.py               structlog JSON logger setup + get_logger()
 │
-└── evaluation/                 Phase 7 — Ragas pipeline
-    └── evaluate.py             Ground truth runner + metric reporting
+└── evaluation/
+    ├── ground_truth.py         5 hand-written (question, answer, expected_contexts) entries
+    ├── pipeline.py             Runs agent_graph per entry, collects Ragas inputs
+    └── metrics.py              Ragas scoring + threshold checks + print_report()
 
 scripts/
-└── seed_sample_logs.py         3 realistic incident scenarios for testing
+├── seed_sample_logs.py         3 realistic incident scenarios for testing
+└── evaluate.py                 CLI: --question N, --dry-run flags
+
+main.py                         Uvicorn entry point — imports create_app()
 
 docs/
 ├── BRD.md                      Business requirements (what and why)
@@ -494,8 +554,9 @@ docs/
 | **BAAI/bge-large-en-v1.5** | Embeddings | Top open model on MTEB benchmark; runs locally, no API cost |
 | **BAAI/bge-reranker-large** | Cross-encoder reranking | Sees query+document together; far more accurate than bi-encoder |
 | **LangGraph** | Agent orchestration | State machine with typed state, retry loops, conditional edges |
-| **LangSmith** | Observability | Traces every LLM call automatically with zero code changes |
-| **Ragas** | Evaluation | Faithfulness/hallucination metrics against ground truth |
+| **structlog** | Structured logging | JSON output per module; `get_logger()` returns bound loggers |
+| **LangSmith** | LLM call tracing | Zero-code instrumentation; traces every ChatOpenAI call automatically |
+| **Ragas** | RAG evaluation | Faithfulness/hallucination + retrieval quality metrics against ground truth |
 
 ---
 
@@ -533,3 +594,11 @@ similarity. The cross-encoder sees `(query, document)` as a single input and
 models their exact relationship — much more accurate, but too slow to run on
 every stored document. The two-stage approach (retrieve 20 cheaply, rerank 5
 accurately) hits the right cost-quality tradeoff for a < 2s retrieval SLA.
+
+### Why evaluate with Ragas instead of just testing manually?
+
+Manual testing finds bugs you thought of in advance. Ragas measures the four
+dimensions that matter for RAG systems — hallucination rate, answer relevancy,
+retrieval precision, and retrieval recall — objectively and reproducibly.
+A score drop after changing a prompt or retrieval parameter tells you exactly
+what regressed and by how much, before it reaches production.
