@@ -5,6 +5,10 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
+from src.observability.logger import get_logger
+
+log = get_logger(__name__)
+
 
 class RequestIDMiddleware(BaseHTTPMiddleware):
     """
@@ -15,14 +19,12 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
     requests are interleaved. Without a request ID, you cannot tell which
     log line belongs to which request.
 
-    With a request ID, you can grep your log aggregator:
-        {"request_id": "abc-123", "agent": "critic", "message": "..."}
-    and see the full trace of ONE request across all agents.
+    With a request ID, you can filter your log aggregator:
+        request_id = "abc-123"  →  see every log line for that one request,
+        across all 6 agents, in order.
 
-    The ID is:
-    - Stored on request.state so route handlers can access it
-    - Added to the response header so clients can log it
-    - Short enough to be scannable (first 8 chars of UUID)
+    The ID is stored on request.state so route handlers and agents can
+    attach it to their own log lines.
     """
 
     async def dispatch(self, request: Request, call_next) -> Response:
@@ -35,5 +37,14 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
 
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Response-Time-Ms"] = str(duration_ms)
+
+        log.info(
+            "request_handled",
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+            status_code=response.status_code,
+            duration_ms=duration_ms,
+        )
 
         return response

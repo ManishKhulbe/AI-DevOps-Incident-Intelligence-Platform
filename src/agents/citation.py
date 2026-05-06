@@ -4,6 +4,9 @@ from pydantic import BaseModel, Field
 
 from src.agents.state import AgentState
 from src.config import settings
+from src.observability.logger import get_logger
+
+log = get_logger(__name__)
 
 
 # ── Structured output schema ───────────────────────────────────────────────────
@@ -17,21 +20,15 @@ class Citation(BaseModel):
 
 class CitationOutput(BaseModel):
     citations:      list[Citation] = Field(description="One citation per supported claim")
-    final_response: str            = Field(
-        description="The complete human-readable answer with inline [N] citation markers"
-    )
+    final_response: str            = Field(description="Complete answer with inline [N] citation markers")
 
 
 # ── Prompt ─────────────────────────────────────────────────────────────────────
+
 _PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
         """You are a technical writer producing a final incident report.
-
-Your inputs are:
-1. An RCA with a timeline, root cause, impact, and evidence summary
-2. The retrieved log chunks that were used as evidence
-3. The Critic's confidence score and any flagged low-confidence areas
 
 Your job:
 1. Rewrite the RCA into a clean, professional incident report
@@ -40,21 +37,18 @@ Your job:
 4. For claims the Critic flagged as low-confidence, add "(low confidence)" after the marker
 5. End with a "Citations" section listing each [N] with the source log text
 
-TONE: Direct, factual, technical. No hedging except where confidence is low.
-FORMAT:
-- Start with a one-line summary of the incident
-- Then Timeline, Root Cause, Impact sections
-- End with numbered Citations list
+TONE: Direct, factual, technical.
+FORMAT: One-line summary → Timeline → Root Cause → Impact → Citations
 
 Critic confidence score: {confidence}
-Unsupported claims (mark as low confidence): {unsupported_claims}
+Low-confidence claims: {unsupported_claims}
 
 RCA:
 {reasoning_output}
 
 Log chunks for citation matching:
 {chunks}
-"""
+""",
     ),
     ("human", "Produce the final cited incident report."),
 ])
@@ -62,44 +56,47 @@ Log chunks for citation matching:
 
 def citation_node(state: AgentState) -> dict:
     """
-    Citation Agent — the final node before END.
-
-    Takes the validated RCA and attaches inline citation markers to every
-    factual claim, then builds a citation list mapping each marker to the
-    exact log line that supports it.
-
-    Why citations matter (from the BRD):
-    "Create explainable AI responses with citations" is a core objective.
-    An RCA without citations is an assertion. An RCA with citations is
-    verifiable — the engineer can click to the source log line and confirm
-    the system's reasoning themselves. This is what separates a trustworthy
-    AI tool from a hallucination machine.
-
-    The confidence score from the Critic is passed through so low-confidence
-    claims are visibly flagged rather than silently included.
+    Citation Agent — final node before END.
+    Attaches inline [N] markers to every claim and builds the citation list.
     """
+    feedback       = state.get("critic_feedback", {})
+    confidence     = feedback.get("confidence", 1.0)
+    unsupported    = [i["claim"] for i in feedback.get("issues", [])]
+    chunks         = state["retrieved_chunks"]
+
+    log.info(
+        "agent_start",
+        agent="citation",
+        confidence=confidence,
+        unsupported_claims=len(unsupported),
+        chunks_count=len(chunks),
+    )
+
     llm = ChatOpenAI(
         model="gpt-4o-mini",
         temperature=0,
         api_key=settings.openai_api_key,
     )
 
-    feedback = state.get("critic_feedback", {})
-    confidence = feedback.get("confidence", 1.0)
-    unsupported = [i["claim"] for i in feedback.get("issues", [])]
-
     chunks_text = "\n\n---\n\n".join(
         f"[chunk_id={c['chunk_id']}]\n{c['content']}"
-        for c in state["retrieved_chunks"]
+        for c in chunks
     )
 
     chain = _PROMPT | llm.with_structured_output(CitationOutput)
     result: CitationOutput = chain.invoke({
-        "confidence":        confidence,
+        "confidence":         confidence,
         "unsupported_claims": "\n".join(f"- {c}" for c in unsupported) or "None",
         "reasoning_output":   state["reasoning_output"],
         "chunks":             chunks_text,
     })
+
+    log.info(
+        "agent_done",
+        agent="citation",
+        citations_count=len(result.citations),
+        response_length=len(result.final_response),
+    )
 
     return {
         "citations":      [c.model_dump() for c in result.citations],

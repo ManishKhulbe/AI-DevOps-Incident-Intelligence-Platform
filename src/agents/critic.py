@@ -4,29 +4,26 @@ from pydantic import BaseModel, Field
 
 from src.agents.state import AgentState
 from src.config import settings
+from src.observability.logger import get_logger
+
+log = get_logger(__name__)
 
 
 # ── Structured output schema ───────────────────────────────────────────────────
 
 class CriticIssue(BaseModel):
-    claim: str  = Field(description="The exact claim from the RCA that is unsupported")
+    claim:  str = Field(description="The exact claim from the RCA that is unsupported")
     reason: str = Field(description="Why this claim cannot be verified from the log chunks")
 
 
 class CriticOutput(BaseModel):
-    valid: bool = Field(
-        description="True if every factual claim in the RCA is supported by at least one log chunk"
-    )
-    issues: list[CriticIssue] = Field(
-        default_factory=list,
-        description="List of unsupported claims. Empty if valid=True."
-    )
-    confidence: float = Field(
-        description="Overall confidence score 0.0-1.0 based on how well the evidence supports the RCA"
-    )
+    valid:      bool         = Field(description="True if every factual claim is supported by at least one chunk")
+    issues:     list[CriticIssue] = Field(default_factory=list)
+    confidence: float        = Field(description="Overall confidence 0.0-1.0")
 
 
 # ── Prompt ─────────────────────────────────────────────────────────────────────
+
 _PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
@@ -53,14 +50,14 @@ INSTRUCTIONS:
 3. If a claim is supported by at least one chunk, it passes
 4. If a claim cannot be found in any chunk, add it to issues
 5. Set valid=True only if issues list is EMPTY
-6. Set confidence based on overall evidence quality (0.9+ = strong evidence, 0.5-0.9 = partial, <0.5 = weak)
+6. Set confidence: 0.9+ = strong evidence, 0.5-0.9 = partial, <0.5 = weak
 
 Log chunks (ground truth):
 {chunks}
 
 RCA to validate:
 {reasoning_output}
-"""
+""",
     ),
     ("human", "Validate the RCA against the log chunks."),
 ])
@@ -69,20 +66,15 @@ RCA to validate:
 def critic_node(state: AgentState) -> dict:
     """
     Critic Agent — the hallucination firewall.
-
-    Compares every factual claim in the Reasoning Agent's RCA against the
-    retrieved log chunks. Any claim with no supporting chunk is flagged.
-
-    Why is this a separate agent and not part of Reasoning?
-    Self-validation is unreliable. A model that generated a claim will also
-    tend to confirm it. Having a separate agent with explicit evidence-checking
-    instructions creates a genuine adversarial check.
-
-    The critic_feedback dict drives the Reflection Agent's routing decision:
-    - valid=True  → proceed to Citation Agent
-    - valid=False → Reflection Agent extracts unsupported claims as new queries
-                    and retries retrieval (up to 3 times)
+    Checks every factual claim in the RCA against source chunks.
     """
+    log.info(
+        "agent_start",
+        agent="critic",
+        rca_length=len(state["reasoning_output"]),
+        chunks_count=len(state["retrieved_chunks"]),
+    )
+
     llm = ChatOpenAI(
         model="gpt-4o-mini",
         temperature=0,
@@ -96,8 +88,25 @@ def critic_node(state: AgentState) -> dict:
 
     chain = _PROMPT | llm.with_structured_output(CriticOutput)
     result: CriticOutput = chain.invoke({
-        "chunks": chunks_text,
+        "chunks":           chunks_text,
         "reasoning_output": state["reasoning_output"],
     })
+
+    log.info(
+        "agent_done",
+        agent="critic",
+        valid=result.valid,
+        issues_count=len(result.issues),
+        confidence=result.confidence,
+    )
+
+    if not result.valid:
+        for issue in result.issues:
+            log.warning(
+                "hallucination_detected",
+                agent="critic",
+                claim=issue.claim,
+                reason=issue.reason,
+            )
 
     return {"critic_feedback": result.model_dump()}

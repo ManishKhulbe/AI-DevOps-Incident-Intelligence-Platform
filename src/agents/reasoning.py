@@ -3,6 +3,9 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from src.agents.state import AgentState
 from src.config import settings
+from src.observability.logger import get_logger
+
+log = get_logger(__name__)
 
 
 _PROMPT = ChatPromptTemplate.from_messages([
@@ -38,22 +41,15 @@ Log chunks to analyze:
 {chunks}
 
 User question: {user_query}
-"""
+""",
     ),
     ("human", "Produce the RCA based on the log chunks above."),
 ])
 
 
 def _format_chunks(chunks: list[dict]) -> str:
-    """
-    Format retrieved chunks into a numbered list for the prompt.
-
-    Why numbered? The Critic Agent references chunk numbers when flagging
-    unsupported claims, making it easier to cross-reference evidence.
-    """
     if not chunks:
         return "No log chunks retrieved."
-
     parts = []
     for i, chunk in enumerate(chunks, start=1):
         parts.append(
@@ -67,29 +63,28 @@ def _format_chunks(chunks: list[dict]) -> str:
 
 def reasoning_node(state: AgentState) -> dict:
     """
-    Reasoning Agent — builds the timeline and draft RCA.
-
-    This is the most prompt-sensitive node. The "ONLY on the log chunks provided"
-    constraint is the primary defence against hallucination. The Critic Agent
-    will check every factual claim against the chunks — any claim that cannot
-    be traced back here will trigger a retry.
-
-    temperature=0 is critical here. Higher temperatures make the model more
-    creative, which means it will invent plausible-sounding causes not in the
-    logs. For evidence-grounded analysis, creativity is the enemy.
+    Reasoning Agent — builds the timeline and draft RCA from retrieved evidence.
+    temperature=0 is critical: creativity here means hallucination.
     """
+    chunks = state["retrieved_chunks"]
+    log.info("agent_start", agent="reasoning", chunks_available=len(chunks))
+
     llm = ChatOpenAI(
         model="gpt-4o-mini",
         temperature=0,
         api_key=settings.openai_api_key,
     )
 
-    chunks_text = _format_chunks(state["retrieved_chunks"])
-
     chain = _PROMPT | llm
     response = chain.invoke({
-        "chunks": chunks_text,
+        "chunks":     _format_chunks(chunks),
         "user_query": state["user_query"],
     })
+
+    log.info(
+        "agent_done",
+        agent="reasoning",
+        output_length=len(response.content),
+    )
 
     return {"reasoning_output": response.content}

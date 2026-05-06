@@ -3,14 +3,13 @@ from pydantic import BaseModel, Field
 
 from src.ingestion.models import RawLog
 from src.ingestion.pipeline import ingest
+from src.observability.logger import get_logger
 
 router = APIRouter(tags=["ingestion"])
+log = get_logger(__name__)
 
 
 # ── Request / Response models ──────────────────────────────────────────────────
-# These are separate from the internal RawLog model intentionally.
-# The API contract (what the caller sends) and the internal model (how we
-# process it) should be decoupled — a future API change won't break internals.
 
 class IngestRequest(BaseModel):
     source:       str = Field(..., description="Log format: 'text', 'json', or 'kubernetes'")
@@ -52,18 +51,17 @@ async def ingest_logs(body: IngestRequest, request: Request) -> IngestResponse:
 
     Flow inside this handler:
         IngestRequest → RawLog → pipeline.ingest() → dual-write → IngestResponse
-
-    Why async?
-    pipeline.ingest() calls qdrant_store and es_store which both do network I/O.
-    Async lets FastAPI handle other incoming requests while waiting for those
-    writes to complete, instead of blocking the entire server.
-
-    Error handling:
-    We let pipeline.ingest() exceptions bubble up here and convert them to
-    HTTP 500 with a clear message. The caller can retry — both stores use
-    chunk_id as the document key, so re-ingesting the same log is idempotent.
     """
     request_id = getattr(request.state, "request_id", "unknown")
+
+    log.info(
+        "ingest_started",
+        request_id=request_id,
+        service_name=body.service_name,
+        environment=body.environment,
+        source=body.source,
+        content_length=len(body.content),
+    )
 
     try:
         raw_log = RawLog(
@@ -74,10 +72,24 @@ async def ingest_logs(body: IngestRequest, request: Request) -> IngestResponse:
         )
         result = await ingest(raw_log)
     except Exception as exc:
+        log.error(
+            "ingest_failed",
+            request_id=request_id,
+            service_name=body.service_name,
+            error=str(exc),
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Ingestion failed: {exc}",
         )
+
+    log.info(
+        "ingest_completed",
+        request_id=request_id,
+        log_id=result["log_id"],
+        chunks_stored=result["chunks_stored"],
+        service_name=body.service_name,
+    )
 
     return IngestResponse(
         log_id=result["log_id"],
