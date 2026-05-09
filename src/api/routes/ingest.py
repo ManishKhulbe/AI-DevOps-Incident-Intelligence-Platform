@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, status
 from pydantic import BaseModel, Field
 
 from src.ingestion.models import RawLog
@@ -96,4 +96,98 @@ async def ingest_logs(body: IngestRequest, request: Request) -> IngestResponse:
         chunks_stored=result["chunks_stored"],
         request_id=request_id,
         message=f"Successfully stored {result['chunks_stored']} chunks.",
+    )
+
+
+# ── File Upload Route ──────────────────────────────────────────────────────────
+
+ALLOWED_EXTENSIONS = {".log", ".txt"}
+MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB
+
+
+@router.post(
+    "/ingest/file",
+    response_model=IngestResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Ingest log file",
+    description="Upload a .log or .txt file directly. Reads the file content and runs the full ingest pipeline.",
+)
+async def ingest_file(
+    request: Request,
+    file: UploadFile = File(..., description="A .log or .txt file"),
+    source: str = Form("text", description="Log format: 'text', 'json', or 'kubernetes'"),
+    service_name: str = Form(..., description="Name of the service that produced these logs"),
+    environment: str = Form("prod", description="Environment: 'prod', 'staging', 'dev'"),
+) -> IngestResponse:
+    request_id = getattr(request.state, "request_id", "unknown")
+
+    # Validate file extension
+    filename = file.filename or ""
+    ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"Only {', '.join(ALLOWED_EXTENSIONS)} files are supported. Got: '{ext or 'no extension'}'",
+        )
+
+    # Read file with size guard
+    content_bytes = await file.read(MAX_FILE_SIZE + 1)
+    if len(content_bytes) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File exceeds the 500 MB limit.",
+        )
+
+    try:
+        content = content_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="File is not valid UTF-8 text.",
+        )
+
+    log.info(
+        "ingest_file_started",
+        request_id=request_id,
+        filename=filename,
+        service_name=service_name,
+        environment=environment,
+        source=source,
+        file_size_bytes=len(content_bytes),
+    )
+
+    try:
+        raw_log = RawLog(
+            source=source,
+            service_name=service_name,
+            environment=environment,
+            content=content,
+        )
+        result = await ingest(raw_log)
+    except Exception as exc:
+        log.error(
+            "ingest_file_failed",
+            request_id=request_id,
+            filename=filename,
+            service_name=service_name,
+            error=str(exc),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Ingestion failed: {exc}",
+        )
+
+    log.info(
+        "ingest_file_completed",
+        request_id=request_id,
+        filename=filename,
+        log_id=result["log_id"],
+        chunks_stored=result["chunks_stored"],
+    )
+
+    return IngestResponse(
+        log_id=result["log_id"],
+        chunks_stored=result["chunks_stored"],
+        request_id=request_id,
+        message=f"Successfully stored {result['chunks_stored']} chunks from '{filename}'.",
     )
